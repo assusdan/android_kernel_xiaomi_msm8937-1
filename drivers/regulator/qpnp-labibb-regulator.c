@@ -15,6 +15,7 @@
 #include <linux/delay.h>
 #include <linux/err.h>
 #include <linux/init.h>
+#include <linux/interrupt.h>
 #include <linux/kernel.h>
 #include <linux/module.h>
 #include <linux/of.h>
@@ -138,6 +139,8 @@
 #define REG_IBB_CURRENT_LIMIT		0x4B
 #define REG_IBB_PS_CTL			0x50
 #define REG_IBB_RDSON_MNGMNT		0x53
+#define REG_IBB_NONOVERLAP_TIME_1	0x56
+#define REG_IBB_NONOVERLAP_TIME_2	0x57
 #define REG_IBB_PWRUP_PWRDN_CTL_1	0x58
 #define REG_IBB_PWRUP_PWRDN_CTL_2	0x59
 #define REG_IBB_SOFT_START_CTL		0x5F
@@ -196,11 +199,22 @@
 #define IBB_PFET_SW_SIZE_MASK		((1 << PFET_SW_SIZE_BITS) - 1)
 #define IBB_NFET_SW_SIZE_SHIFT		3
 
+/* REG_IBB_NONOVERLAP_TIME_1 */
+#define IBB_OVERRIDE_NONOVERLAP	BIT(6)
+#define IBB_NONOVERLAP_NFET_BITS	3
+#define IBB_NONOVERLAP_NFET_MASK	((1 << IBB_NONOVERLAP_NFET_BITS) - 1)
+#define IBB_NFET_GATE_DELAY_2		0x3
+
+/* REG_IBB_NONOVERLAP_TIME_2 */
+#define IBB_N2P_MUX_SEL		BIT(0)
+
 /* REG_IBB_SOFT_START_CTL */
 #define IBB_SOFT_START_CHARGING_RESISTOR_16K	0x3
 
 /* REG_IBB_SPARE_CTL */
 #define IBB_BYPASS_PWRDN_DLY2_BIT	BIT(5)
+#define IBB_POFF_CTL_MASK		BIT(4)
+#define IBB_FASTER_PFET_OFF		BIT(4)
 #define IBB_FAST_STARTUP		BIT(3)
 
 /* REG_IBB_SWIRE_CTL */
@@ -231,6 +245,9 @@
 #define IBB_DIS_DLY_BITS		2
 #define IBB_DIS_DLY_MASK		((1 << IBB_DIS_DLY_BITS) - 1)
 #define IBB_WAIT_MBG_OK			BIT(2)
+
+/* Constants */
+#define SWIRE_DEFAULT_2ND_CMD_DLY_MS	20
 
 enum pmic_subtype {
 	PMI8994		= 10,
@@ -265,6 +282,7 @@ enum ibb_mode {
 	IBB_SW_CONTROL_EN,
 	IBB_SW_CONTROL_DIS,
 	IBB_HW_CONTROL,
+	IBB_HW_SW_CONTROL,
 };
 
 static const int ibb_discharge_resistor_plan[] = {
@@ -422,6 +440,7 @@ struct lab_regulator {
 	struct regulator_dev		*rdev;
 	struct mutex			lab_mutex;
 
+	int				lab_vreg_ok_irq;
 	int				curr_volt;
 	int				min_volt;
 
@@ -464,6 +483,8 @@ struct qpnp_labibb {
 	bool				ibb_settings_saved;
 	bool				swire_control;
 	bool				ttw_force_lab_on;
+	bool				skip_2nd_swire_cmd;
+	u32				swire_2nd_cmd_delay;
 };
 
 enum ibb_settings_index {
@@ -651,6 +672,8 @@ static int qpnp_ibb_set_mode(struct qpnp_labibb *labibb, enum ibb_mode mode)
 		val = IBB_ENABLE_CTL_MODULE_EN;
 	else if (mode == IBB_HW_CONTROL)
 		val = IBB_ENABLE_CTL_SWIRE_RDY;
+	else if (mode == IBB_HW_SW_CONTROL)
+		val = IBB_ENABLE_CTL_MODULE_EN | IBB_ENABLE_CTL_SWIRE_RDY;
 	else if (mode == IBB_SW_CONTROL_DIS)
 		val = 0;
 	else
@@ -1208,12 +1231,12 @@ static int qpnp_labibb_regulator_ttw_mode_enter(struct qpnp_labibb *labibb)
 	return 0;
 }
 
-static int qpnp_labibb_ttw_exit_ibb_pmi8996(struct qpnp_labibb *labibb)
+static int qpnp_labibb_ttw_exit_ibb_common(struct qpnp_labibb *labibb)
 {
 	int rc;
 	u8 val;
 
-	val = 0;
+	val = IBB_FASTER_PFET_OFF;
 	rc = qpnp_labibb_write(labibb, labibb->ibb_base + REG_IBB_SPARE_CTL,
 			&val, 1);
 	if (rc)
@@ -1271,7 +1294,9 @@ static int qpnp_labibb_regulator_ttw_mode_exit(struct qpnp_labibb *labibb)
 
 	switch (labibb->pmic_rev_id->pmic_subtype) {
 	case PMI8996:
-		rc = qpnp_labibb_ttw_exit_ibb_pmi8996(labibb);
+	case PMI8994:
+	case PMI8950:
+		rc = qpnp_labibb_ttw_exit_ibb_common(labibb);
 		break;
 	}
 	if (rc) {
@@ -1551,6 +1576,77 @@ static int qpnp_lab_regulator_set_voltage(struct regulator_dev *rdev,
 	return 0;
 }
 
+static int qpnp_skip_swire_command(struct qpnp_labibb *labibb)
+{
+	int rc = 0, retry = 50, dly;
+	u8 reg;
+
+	do {
+		/* poll for ibb vreg_ok */
+		rc = qpnp_labibb_read(labibb, &reg,
+			labibb->ibb_base + REG_IBB_STATUS1, 1);
+		if (rc) {
+			pr_err("Failed to read ibb_status1 reg rc=%d\n", rc);
+			return rc;
+		}
+		if ((reg & IBB_STATUS1_VREG_OK_MASK) == IBB_STATUS1_VREG_OK)
+			break;
+
+		/* poll delay */
+		usleep_range(500, 600);
+
+	} while (--retry);
+
+	if (!retry) {
+		pr_err("ibb vreg_ok failed to turn-on\n");
+		return -EBUSY;
+	}
+
+	/* move to SW control */
+	rc = qpnp_ibb_set_mode(labibb, IBB_SW_CONTROL_EN);
+	if (rc) {
+		pr_err("Failed switch to IBB_SW_CONTROL rc=%d\n", rc);
+		return rc;
+	}
+
+	/* delay to skip the second swire command */
+	dly = labibb->swire_2nd_cmd_delay * 1000;
+	while (dly / 20000) {
+		usleep_range(20000, 20010);
+		dly -= 20000;
+	}
+	if (dly)
+		usleep_range(dly, dly + 10);
+
+	rc = qpnp_ibb_set_mode(labibb, IBB_HW_SW_CONTROL);
+	if (rc) {
+		pr_err("Failed switch to IBB_HW_SW_CONTROL rc=%d\n", rc);
+		return rc;
+	}
+
+	/* delay for SPMI to SWIRE transition */
+	usleep_range(1000, 1100);
+
+	/* Move back to SWIRE control */
+	rc = qpnp_ibb_set_mode(labibb, IBB_HW_CONTROL);
+	if (rc)
+		pr_err("Failed switch to IBB_HW_CONTROL rc=%d\n", rc);
+
+	return rc;
+}
+
+static irqreturn_t lab_vreg_ok_handler(int irq, void *_labibb)
+{
+	struct qpnp_labibb *labibb = _labibb;
+	int rc;
+
+	rc = qpnp_skip_swire_command(labibb);
+	if (rc)
+		pr_err("Failed in 'qpnp_skip_swire_command' rc=%d\n", rc);
+
+	return IRQ_HANDLED;
+}
+
 static int qpnp_lab_regulator_get_voltage(struct regulator_dev *rdev)
 {
 	struct qpnp_labibb *labibb  = rdev_get_drvdata(rdev);
@@ -1705,6 +1801,19 @@ static int register_qpnp_lab_regulator(struct qpnp_labibb *labibb,
 		if (rc) {
 			pr_err("qpnp_labibb_write register %x failed rc = %d\n",
 				REG_LAB_CURRENT_SENSE, rc);
+			return rc;
+		}
+	}
+
+	if (labibb->skip_2nd_swire_cmd) {
+		rc = devm_request_threaded_irq(labibb->dev,
+				labibb->lab_vreg.lab_vreg_ok_irq, NULL,
+				lab_vreg_ok_handler,
+				IRQF_ONESHOT | IRQF_TRIGGER_RISING,
+				"lab-vreg-ok", labibb);
+		if (rc) {
+			pr_err("Failed to register 'lab-vreg-ok' irq rc=%d\n",
+						rc);
 			return rc;
 		}
 	}
@@ -2456,6 +2565,41 @@ static int register_qpnp_ibb_regulator(struct qpnp_labibb *labibb,
 			return rc;
 		}
 	}
+
+	if (labibb->mode == QPNP_LABIBB_AMOLED_MODE) {
+		val = IBB_OVERRIDE_NONOVERLAP | IBB_NFET_GATE_DELAY_2;
+		rc = qpnp_labibb_sec_masked_write(labibb, labibb->ibb_base,
+			REG_IBB_NONOVERLAP_TIME_1,
+			IBB_OVERRIDE_NONOVERLAP | IBB_NONOVERLAP_NFET_MASK,
+			val);
+
+		if (rc) {
+			pr_err("qpnp_labibb_sec_masked_write register %x failed rc = %d\n",
+				REG_IBB_NONOVERLAP_TIME_1, rc);
+			return rc;
+		}
+
+		val = IBB_N2P_MUX_SEL;
+		rc = qpnp_labibb_sec_write(labibb, labibb->ibb_base,
+			REG_IBB_NONOVERLAP_TIME_2, &val, 1);
+
+		if (rc) {
+			pr_err("qpnp_labibb_sec_write register %x failed rc = %d\n",
+				REG_IBB_NONOVERLAP_TIME_2, rc);
+			return rc;
+		}
+
+		val = IBB_FASTER_PFET_OFF;
+		rc = qpnp_labibb_masked_write(labibb,
+			labibb->ibb_base + REG_IBB_SPARE_CTL,
+			IBB_POFF_CTL_MASK, val);
+		if (rc) {
+			pr_err("qpnp_labibb_masked_write %x failed rc = %d\n",
+				REG_IBB_SPARE_CTL, rc);
+			return rc;
+		}
+	}
+
 	rc = qpnp_labibb_read(labibb, &val,
 			labibb->ibb_base + REG_IBB_MODULE_RDY, 1);
 	if (rc) {
@@ -2509,6 +2653,22 @@ static int register_qpnp_ibb_regulator(struct qpnp_labibb *labibb,
 	}
 
 	mutex_init(&(labibb->ibb_vreg.ibb_mutex));
+	return 0;
+}
+
+static int qpnp_lab_register_irq(struct spmi_resource *spmi_resource,
+					struct qpnp_labibb *labibb)
+{
+	if (labibb->skip_2nd_swire_cmd) {
+		labibb->lab_vreg.lab_vreg_ok_irq =
+					spmi_get_irq_byname(labibb->spmi,
+					spmi_resource, "lab-vreg-ok");
+		if (labibb->lab_vreg.lab_vreg_ok_irq < 0) {
+			pr_err("Invalid lab-vreg-ok irq\n");
+			return -EINVAL;
+		}
+	}
+
 	return 0;
 }
 
@@ -2617,6 +2777,17 @@ static int qpnp_labibb_regulator_probe(struct spmi_device *spmi)
 		pr_err("Invalid mode for SWIRE control\n");
 		return -EINVAL;
 	}
+	if (labibb->swire_control) {
+		labibb->skip_2nd_swire_cmd =
+				of_property_read_bool(labibb->dev->of_node,
+				"qcom,skip-2nd-swire-cmd");
+		rc = of_property_read_u32(labibb->dev->of_node,
+				"qcom,swire-2nd-cmd-delay",
+				&labibb->swire_2nd_cmd_delay);
+		if (rc)
+			labibb->swire_2nd_cmd_delay =
+					SWIRE_DEFAULT_2ND_CMD_DLY_MS;
+	}
 
 	spmi_for_each_container_dev(spmi_resource, spmi) {
 		if (!spmi_resource) {
@@ -2642,6 +2813,12 @@ static int qpnp_labibb_regulator_probe(struct spmi_device *spmi)
 		switch (type) {
 		case QPNP_LAB_TYPE:
 			labibb->lab_base = resource->start;
+			rc = qpnp_lab_register_irq(spmi_resource, labibb);
+			if (rc) {
+				pr_err("Failed to register LAB IRQ rc=%d\n",
+							rc);
+				goto fail_registration;
+			}
 			rc = register_qpnp_lab_regulator(labibb,
 				spmi_resource->of_node);
 			if (rc)

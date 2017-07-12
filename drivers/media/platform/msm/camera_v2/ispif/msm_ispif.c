@@ -388,11 +388,6 @@ static int msm_ispif_clk_ahb_enable(struct ispif_device *ispif, int enable)
 {
 	int rc = 0;
 
-	if (ispif->csid_version < CSID_VERSION_V30) {
-		/* Older ISPIF versiond don't need ahb clokc */
-		return 0;
-	}
-
 	rc = msm_cam_clk_enable(&ispif->pdev->dev,
 		ispif_ahb_clk_info, ispif->ahb_clk,
 		ispif->num_ahb_clk, enable);
@@ -1295,9 +1290,15 @@ static irqreturn_t msm_io_ispif_irq(int irq_num, void *data)
 static int msm_ispif_set_vfe_info(struct ispif_device *ispif,
 	struct msm_ispif_vfe_info *vfe_info)
 {
-	memcpy(&ispif->vfe_info, vfe_info, sizeof(struct msm_ispif_vfe_info));
-	if (ispif->vfe_info.num_vfe > ispif->hw_num_isps)
+	if (!vfe_info || (vfe_info->num_vfe == 0) ||
+		(vfe_info->num_vfe > ispif->hw_num_isps)) {
+		pr_err("Invalid VFE info: %p %d\n", vfe_info,
+			   (vfe_info ? vfe_info->num_vfe : 0));
 		return -EINVAL;
+	}
+
+	memcpy(&ispif->vfe_info, vfe_info, sizeof(struct msm_ispif_vfe_info));
+
 	return 0;
 }
 
@@ -1492,20 +1493,8 @@ static long msm_ispif_subdev_ioctl(struct v4l2_subdev *sd,
 	}
 	case MSM_SD_UNNOTIFY_FREEZE:
 		return 0;
-	case MSM_SD_SHUTDOWN: {
-		struct ispif_device *ispif =
-			(struct ispif_device *)v4l2_get_subdevdata(sd);
-
-		if (ispif && ispif->base) {
-			while (ispif->open_cnt != 0)
-				ispif_close_node(sd, NULL);
-		} else {
-			pr_debug("%s:SD SHUTDOWN fail, ispif%s %p\n", __func__,
-				ispif ? "_base" : "",
-				ispif ? ispif->base : NULL);
-		}
+	case MSM_SD_SHUTDOWN:
 		return 0;
-	}
 	default:
 		pr_err_ratelimited("%s: invalid cmd 0x%x received\n",
 			__func__, cmd);
