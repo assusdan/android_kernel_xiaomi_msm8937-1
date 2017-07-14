@@ -174,7 +174,7 @@ static struct afe_clk_set wsa_ana_clk = {
 };
 
 static char const *rx_bit_format_text[] = {"S16_LE", "S24_LE"};
-static const char *const mi2s_ch_text[] = {"One", "Two"};
+static const char *const ter_mi2s_tx_ch_text[] = {"One", "Two"};
 static const char *const loopback_mclk_text[] = {"DISABLE", "ENABLE"};
 static const char *const btsco_rate_text[] = {"BTSCO_RATE_8KHZ",
 	"BTSCO_RATE_16KHZ"};
