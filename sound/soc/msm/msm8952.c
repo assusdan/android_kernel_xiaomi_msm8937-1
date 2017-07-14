@@ -184,9 +184,6 @@ static const char *const vi_feed_ch_text[] = {"One", "Two"};
 static const char *const lineout_text[] = {"DISABLE", "ENABLE", "DUALMODE"};
 static const char *const hs_amp_text[] = {"DISABLE", "ENABLE"};
 
-static char const *mi2s_rx_sample_rate_text[] = {"KHZ_48",
-					"KHZ_96", "KHZ_192"};
-
 static inline int param_is_mask(int p)
 {
 	return (p >= SNDRV_PCM_HW_PARAM_FIRST_MASK) &&
