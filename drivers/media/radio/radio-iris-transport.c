@@ -209,7 +209,7 @@ static void radio_hci_smd_deregister(void)
 	if (hs.hdev == NULL)
 		return;
 
-	radio_hci_unregister_dev(hs.hdev);
+	radio_hci_unregister_dev();
 	kfree(hs.hdev);
 	hs.hdev = NULL;
 
