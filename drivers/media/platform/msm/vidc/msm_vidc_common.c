@@ -44,10 +44,42 @@
 		V4L2_EVENT_MSM_VIDC_PORT_SETTINGS_CHANGED_INSUFFICIENT
 #define V4L2_EVENT_RELEASE_BUFFER_REFERENCE \
 		V4L2_EVENT_MSM_VIDC_RELEASE_BUFFER_REFERENCE
-#define V4L2_EVENT_SEQ_BITDEPTH_CHANGED_INSUFFICIENT \
-		V4L2_EVENT_MSM_VIDC_PORT_SETTINGS_BITDEPTH_CHANGED_INSUFFICIENT
 
 #define MAX_SUPPORTED_INSTANCES 16
+
+const char *const mpeg_video_vidc_extradata[] = {
+	"Extradata none",
+	"Extradata MB Quantization",
+	"Extradata Interlace Video",
+	"Extradata VC1 Framedisp",
+	"Extradata VC1 Seqdisp",
+	"Extradata timestamp",
+	"Extradata S3D Frame Packing",
+	"Extradata Frame Rate",
+	"Extradata Panscan Window",
+	"Extradata Recovery point SEI",
+	"Extradata Multislice info",
+	"Extradata number of concealed MB",
+	"Extradata metadata filler",
+	"Extradata input crop",
+	"Extradata digital zoom",
+	"Extradata aspect ratio",
+	"Extradata mpeg2 seqdisp",
+	"Extradata stream userdata",
+	"Extradata frame QP",
+	"Extradata frame bits info",
+	"Extradata LTR",
+	"Extradata macroblock metadata",
+	"Extradata VQZip SEI",
+	"Extradata YUV Stats",
+	"Extradata ROI QP",
+	"Extradata output crop",
+	"Extradata display colour SEI",
+	"Extradata light level SEI",
+	"Extradata display VUI",
+	"Extradata vpx color space",
+	"Extradata PQ Info",
+};
 
 struct getprop_buf {
 	struct list_head list;
@@ -179,7 +211,8 @@ int msm_comm_ctrl_init(struct msm_vidc_inst *inst,
 		}
 
 		if (!ctrl) {
-			dprintk(VIDC_ERR, "%s - invalid ctrl\n", __func__);
+			dprintk(VIDC_ERR, "%s - invalid ctrl %s\n", __func__,
+				 drv_ctrls[idx].name);
 			return -EINVAL;
 		}
 
@@ -1023,8 +1056,8 @@ static void handle_event_change(enum hal_command_response cmd, void *data)
 	int event = V4L2_EVENT_SEQ_CHANGED_INSUFFICIENT;
 	struct v4l2_event seq_changed_event = {0};
 	int rc = 0;
-	bool bit_depth_changed = false;
 	struct hfi_device *hdev;
+	u32 *ptr = NULL;
 
 	if (!event_notify) {
 		dprintk(VIDC_WARN, "Got an empty event from hfi\n");
@@ -1144,23 +1177,46 @@ static void handle_event_change(enum hal_command_response cmd, void *data)
 		break;
 	}
 
+	/* Bit depth and pic struct changed event are combined into a single
+	 * event (insufficient event) for the userspace. Currently bitdepth
+	 * changes is only for HEVC and interlaced support is for all
+	 * codecs except HEVC
+	 * event data is now as follows:
+	 * u32 *ptr = seq_changed_event.u.data;
+	 * ptr[0] = height
+	 * ptr[1] = width
+	 * ptr[2] = flag to indicate bit depth or/and pic struct changed
+	 * ptr[3] = bit depth
+	 * ptr[4] = pic struct (progressive or interlaced)
+	 */
+
+	ptr = (u32 *)seq_changed_event.u.data;
+	ptr[2] = 0x0;
+	ptr[3] = inst->bit_depth;
+	ptr[4] = inst->pic_struct;
+
+	if (inst->bit_depth != event_notify->bit_depth) {
+		inst->bit_depth = event_notify->bit_depth;
+		ptr[2] |= V4L2_EVENT_BITDEPTH_FLAG;
+		ptr[3] = inst->bit_depth;
+		event = V4L2_EVENT_SEQ_CHANGED_INSUFFICIENT;
+		dprintk(VIDC_DBG,
+			"V4L2_EVENT_SEQ_CHANGED_INSUFFICIENT due to bit-depth change\n");
+	}
+
+	if (inst->pic_struct != event_notify->pic_struct) {
+		inst->pic_struct = event_notify->pic_struct;
+		event = V4L2_EVENT_SEQ_CHANGED_INSUFFICIENT;
+		ptr[2] |= V4L2_EVENT_PICSTRUCT_FLAG;
+		ptr[4] = inst->pic_struct;
+		dprintk(VIDC_DBG,
+			"V4L2_EVENT_SEQ_CHANGED_INSUFFICIENT due to pic-struct change\n");
+	}
+
 	if (event == V4L2_EVENT_SEQ_CHANGED_INSUFFICIENT) {
 		dprintk(VIDC_DBG, "V4L2_EVENT_SEQ_CHANGED_INSUFFICIENT\n");
 		inst->reconfig_height = event_notify->height;
 		inst->reconfig_width = event_notify->width;
-
-		if (inst->bit_depth != event_notify->bit_depth) {
-			inst->bit_depth = event_notify->bit_depth;
-			bit_depth_changed = true;
-			seq_changed_event.u.data[0] = inst->bit_depth;
-			event = V4L2_EVENT_SEQ_BITDEPTH_CHANGED_INSUFFICIENT;
-			dprintk(VIDC_DBG,
-					"V4L2_EVENT_SEQ_BITDEPTH_CHANGED_INSUFFICIENT\n");
-		} else {
-			dprintk(VIDC_DBG,
-					"V4L2_EVENT_SEQ_CHANGED_INSUFFICIENT\n");
-		}
-
 		inst->in_reconfig = true;
 	} else {
 		dprintk(VIDC_DBG, "V4L2_EVENT_SEQ_CHANGED_SUFFICIENT\n");
@@ -3334,8 +3390,8 @@ exit:
 int msm_vidc_comm_cmd(void *instance, union msm_v4l2_cmd *cmd)
 {
 	struct msm_vidc_inst *inst = instance;
-	struct v4l2_decoder_cmd *dec;
-	struct v4l2_encoder_cmd *enc;
+	struct v4l2_decoder_cmd *dec = NULL;
+	struct v4l2_encoder_cmd *enc = NULL;
 	struct msm_vidc_core *core;
 	int which_cmd = 0, flags = 0, rc = 0;
 
@@ -3386,18 +3442,21 @@ int msm_vidc_comm_cmd(void *instance, union msm_v4l2_cmd *cmd)
 
 		output_buf = get_buff_req_buffer(inst,
 				msm_comm_get_hal_output_buffer(inst));
-		if (!output_buf) {
+		if (output_buf) {
+			if (dec) {
+				ptr = (u32 *)dec->raw.data;
+				ptr[0] = output_buf->buffer_size;
+				ptr[1] = output_buf->buffer_count_actual;
+				dprintk(VIDC_DBG,
+					"Reconfig hint, size is %u, count is %u\n",
+					ptr[0], ptr[1]);
+			} else {
+				dprintk(VIDC_ERR, "Null decoder\n");
+			}
+		} else {
 			dprintk(VIDC_DBG,
 					"This output buffer not required, buffer_type: %x\n",
 					HAL_BUFFER_OUTPUT);
-		} else {
-			ptr = (u32 *)dec->raw.data;
-			ptr[0] = output_buf->buffer_size;
-			ptr[1] = output_buf->buffer_count_actual;
-			dprintk(VIDC_DBG,
-				"Reconfig hint, size is %u, count is %u\n",
-				ptr[0], ptr[1]);
-
 		}
 		break;
 	}
@@ -4589,6 +4648,24 @@ enum hal_extradata_id msm_comm_get_hal_extradata_index(
 		break;
 	case V4L2_MPEG_VIDC_EXTRADATA_ROI_QP:
 		ret = HAL_EXTRADATA_ROI_QP;
+		break;
+	case V4L2_MPEG_VIDC_EXTRADATA_OUTPUT_CROP:
+		ret = HAL_EXTRADATA_OUTPUT_CROP;
+		break;
+	case V4L2_MPEG_VIDC_EXTRADATA_DISPLAY_COLOUR_SEI:
+		ret = HAL_EXTRADATA_MASTERING_DISPLAY_COLOUR_SEI;
+		break;
+	case V4L2_MPEG_VIDC_EXTRADATA_CONTENT_LIGHT_LEVEL_SEI:
+		ret = HAL_EXTRADATA_CONTENT_LIGHT_LEVEL_SEI;
+		break;
+	case V4L2_MPEG_VIDC_EXTRADATA_VUI_DISPLAY:
+		ret = HAL_EXTRADATA_VUI_DISPLAY_INFO;
+		break;
+	case V4L2_MPEG_VIDC_EXTRADATA_VPX_COLORSPACE:
+		ret = HAL_EXTRADATA_VPX_COLORSPACE;
+		break;
+	case V4L2_MPEG_VIDC_EXTRADATA_PQ_INFO:
+		ret = HAL_EXTRADATA_PQ_INFO;
 		break;
 	default:
 		dprintk(VIDC_WARN, "Extradata not found: %d\n", index);
