@@ -1026,51 +1026,6 @@ static int msm_pri_mi2s_rx_ch_put(struct snd_kcontrol *kcontrol,
 	return 1;
 }
 
-static int mi2s_rx_sample_rate_get(struct snd_kcontrol *kcontrol,
-				struct snd_ctl_elem_value *ucontrol)
-{
-	int sample_rate_val = 0;
-
-	switch (mi2s_rx_sample_rate) {
-	case SAMPLING_RATE_96KHZ:
-		sample_rate_val = 1;
-		break;
-	case SAMPLING_RATE_192KHZ:
-		sample_rate_val = 2;
-		break;
-	case SAMPLING_RATE_48KHZ:
-	default:
-		sample_rate_val = 0;
-		break;
-	}
-
-	ucontrol->value.integer.value[0] = sample_rate_val;
-	pr_debug("%s: sample_rate_val = %d\n", __func__,
-		 sample_rate_val);
-
-	return 0;
-}
-
-static int mi2s_rx_sample_rate_put(struct snd_kcontrol *kcontrol,
-				    struct snd_ctl_elem_value *ucontrol)
-{
-	switch (ucontrol->value.integer.value[0]) {
-	case 1:
-		mi2s_rx_sample_rate = SAMPLING_RATE_96KHZ;
-		break;
-	case 2:
-		mi2s_rx_sample_rate = SAMPLING_RATE_192KHZ;
-		break;
-	case 0:
-	default:
-		mi2s_rx_sample_rate = SAMPLING_RATE_48KHZ;
-		break;
-	}
-	pr_debug("%s: mi2s_rx_sample_rate = %d\n", __func__,
-		 mi2s_rx_sample_rate);
-	return 0;
-}
-
 static int msm_ter_mi2s_tx_ch_get(struct snd_kcontrol *kcontrol,
 	struct snd_ctl_elem_value *ucontrol)
 {
@@ -1131,11 +1086,11 @@ static const struct snd_kcontrol_new msm_snd_controls[] = {
 			msm_pri_mi2s_rx_ch_get, msm_pri_mi2s_rx_ch_put),
 	SOC_ENUM_EXT("Loopback MCLK", msm_snd_enum[2],
 			loopback_mclk_get, loopback_mclk_put),
-	SOC_ENUM_EXT("Internal BTSCO SampleRate", msm_snd_enum[3],
+	SOC_ENUM_EXT("Internal BTSCO SampleRate", msm_btsco_enum[0],
 		     msm_btsco_rate_get, msm_btsco_rate_put),
-	SOC_ENUM_EXT("PROXY_RX Channels", msm_snd_enum[4],
+	SOC_ENUM_EXT("PROXY_RX Channels", msm_snd_enum[3],
 			msm_proxy_rx_ch_get, msm_proxy_rx_ch_put),
-	SOC_ENUM_EXT("VI_FEED_TX Channels", msm_snd_enum[5],
+	SOC_ENUM_EXT("VI_FEED_TX Channels", msm_snd_enum[4],
 			msm_vi_feed_tx_ch_get, msm_vi_feed_tx_ch_put),
 	SOC_ENUM_EXT("Lineout_1 amp", msm_snd_enum[5],
 		lineout_status_get, lineout_status_put),
